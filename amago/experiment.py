@@ -64,7 +64,11 @@ class Experiment:
     # You can create the list yourself if you want to manually assign different envs across the parallel actors.
     make_train_env: callable | Iterable[callable]
     # same as `make_train_env`, but these environments are only used for evaluation and their trajectories are not saved to disk.
-    make_val_env: callable | Iterable[callable]
+    make_val_train_env: callable | Iterable[callable]
+    # same as `make_train_env`, but these environments are only used for evaluation and their trajectories are not saved to disk.
+    make_val_in_env: callable | Iterable[callable]
+    # same as `make_train_env`, but these environments are only used for evaluation and their trajectories are not saved to disk.
+    make_val_out_env: callable | Iterable[callable]
     # spawns multiple envs in parallel to speed up data collection with batched inference.
     parallel_actors: int = 10
     # two main options: "async" and "already_vectorized".
@@ -255,15 +259,17 @@ class Experiment:
             to_env_list = lambda e: (
                 [e] * self.parallel_actors if not isinstance(e, Iterable) else e
             )
-            make_val_envs = to_env_list(self.make_val_env)
+            make_val_train_envs = to_env_list(self.make_val_train_env)
+            make_val_in_envs = to_env_list(self.make_val_in_env)
+            make_val_out_envs = to_env_list(self.make_val_in_env)
             make_train_envs = to_env_list(self.make_train_env)
             if not len(make_train_envs) == self.parallel_actors:
                 utils.amago_warning(
                     f"`Experiment.parallel_actors` is {self.parallel_actors} but `make_train_env` is a list of length {len(make_train_envs)}"
                 )
-            if not len(make_val_envs) == self.parallel_actors:
+            if not len(make_val_in_envs) == self.parallel_actors:
                 utils.amago_warning(
-                    f"`Experiment.parallel_actors` is {self.parallel_actors} but `make_val_env` is a list of length {len(make_val_envs)}"
+                    f"`Experiment.parallel_actors` is {self.parallel_actors} but `make_val_in_env` is a list of length {len(make_val_in_envs)}"
                 )
             Par = (
                 gym.vector.AsyncVectorEnv
@@ -275,7 +281,9 @@ class Experiment:
             # with a batch dimension on the lowest wrapper level. These envs must auto-reset and treat the last
             # timestep of a trajectory as the first timestep of the next trajectory.
             make_train_envs = [self.make_train_env]
-            make_val_envs = [self.make_val_env]
+            make_val_train_envs = [self.make_val_train_env]
+            make_val_in_envs = [self.make_val_in_env]
+            make_val_out_envs = [self.make_val_out_env]
             Par = AlreadyVectorizedEnv
         else:
             raise ValueError(f"Invalid `env_mode` {self.env_mode}")
@@ -323,7 +331,7 @@ class Experiment:
             )
             for env_func in make_train_envs
         ]
-        make_val = [
+        make_val_train = [
             EnvCreator(
                 make_env=env_func,
                 # do not save trajectories to disk
@@ -332,12 +340,36 @@ class Experiment:
                 exploration_wrapper_type=None,
                 **shared_env_kwargs,
             )
-            for env_func in make_val_envs
+            for env_func in make_val_train_envs
+        ]
+        make_val_in = [
+            EnvCreator(
+                make_env=env_func,
+                # do not save trajectories to disk
+                make_dset=False,
+                # no exploration noise
+                exploration_wrapper_type=None,
+                **shared_env_kwargs,
+            )
+            for env_func in make_val_in_envs
+        ]
+        make_val_out = [
+            EnvCreator(
+                make_env=env_func,
+                # do not save trajectories to disk
+                make_dset=False,
+                # no exploration noise
+                exploration_wrapper_type=None,
+                **shared_env_kwargs,
+            )
+            for env_func in make_val_out_envs
         ]
 
         # make parallel envs
         self.train_envs = Par(make_train)
-        self.val_envs = Par(make_val)
+        self.val_train_envs = Par(make_val_train)
+        self.val_in_envs = Par(make_val_in)
+        self.val_out_envs = Par(make_val_out)
         self.train_envs.reset()
         self.rl2_space = make_train[0].rl2_space
         self.hidden_state = None  # holds train_env hidden state between rollouts
@@ -657,31 +689,35 @@ class Experiment:
         the performance metrics across `accelerate` processes.
         """
         # reset envs first
-        self.val_envs.reset()
-        start_time = time.time()
-        # interact from a blank hidden state that is discarded
-        _, (returns, specials) = self.interact(
-            self.val_envs,
-            self.val_timesteps_per_epoch,
-            hidden_state=None,
-        )
-        end_time = time.time()
-        fps = (
-            self.val_timesteps_per_epoch
-            * self.parallel_actors
-            / (end_time - start_time)
-        )
-        logs_per_process = self.policy_metrics(returns, specials=specials)
-        logs_per_process["Env FPS (per_process)"] = fps
-        # validation metrics are averaged over all processes
-        logs_global = utils.avg_over_accelerate(logs_per_process)
-        if self.verbose:
-            cur_return = logs_global["Average Total Return (Across All Env Names)"]
-            self.accelerator.print(f"Average Return : {cur_return}")
-            self.accelerator.print(
-                f"Env FPS : {fps * self.accelerator.num_processes:.2f}"
+        for val_envs, val_name in zip(
+            [self.val_train_envs, self.val_in_envs, self.val_out_envs],
+            ["val_train", "val_in", "val_out"]
+        ):
+            val_envs.reset()
+            start_time = time.time()
+            # interact from a blank hidden state that is discarded
+            _, (returns, specials) = self.interact(
+                val_envs,
+                self.val_timesteps_per_epoch,
+                hidden_state=None,
             )
-        self.log(logs_global, key="val")
+            end_time = time.time()
+            fps = (
+                self.val_timesteps_per_epoch
+                * self.parallel_actors
+                / (end_time - start_time)
+            )
+            logs_per_process = self.policy_metrics(returns, specials=specials)
+            logs_per_process["Env FPS (per_process)"] = fps
+            # validation metrics are averaged over all processes
+            logs_global = utils.avg_over_accelerate(logs_per_process)
+            if self.verbose:
+                cur_return = logs_global["Average Total Return (Across All Env Names)"]
+                self.accelerator.print(f"Average Return : {cur_return}")
+                self.accelerator.print(
+                    f"Env FPS : {fps * self.accelerator.num_processes:.2f}"
+                )
+            self.log(logs_global, key=val_name)
 
     def evaluate_test(
         self,
