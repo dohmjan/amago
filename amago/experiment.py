@@ -2,7 +2,7 @@ import os
 import time
 import warnings
 import contextlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from collections import defaultdict
 from typing import Optional, Iterable
 import math
@@ -98,6 +98,8 @@ class Experiment:
     verbose: bool = True
     # how many batches between forward/backward passes that spend time computing extra metrics for wandb logging.
     log_interval: int = 300
+    # additional configs that are tracked in wandb, e.g. for grouping/filtering
+    wandb_additional_configs: dict = field(default_factory=lambda: {})
 
     ############
     ## Replay ##
@@ -511,11 +513,12 @@ class Experiment:
         if self.log_to_wandb:
             # records the gin config on the wandb dashboard
             gin_as_wandb = utils.gin_as_wandb_config()
+            wandb_configs = gin_as_wandb | self.wandb_additional_configs
             log_dir = os.path.join(self.dset_root, "wandb_logs")
             os.makedirs(log_dir, exist_ok=True)
             self.accelerator.init_trackers(
                 project_name=self.wandb_project,
-                config=gin_as_wandb,
+                config=wandb_configs,
                 init_kwargs={
                     "wandb": dict(
                         entity=self.wandb_entity,
